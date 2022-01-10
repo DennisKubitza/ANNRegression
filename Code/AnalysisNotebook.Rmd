@@ -1,0 +1,186 @@
+---
+title: "Analysis Notebook"
+author: "Dennis Oliver Kubitza"
+output:
+  html_document:
+    df_print: paged
+e-Mail: dennis.kubitza@bibb.de / denn_kubi@freenet.de
+editor_options:
+  chunk_output_type: inline
+---
+
+
+
+# Introduction
+This document showcases the usage of Neural Networks to detect misspecified regression models (on simulated data).
+The general Methodology is as follows:
+ - We simulate a regression model without errors and postulate a naive regression formula.
+ - We train several neural Networks on the models (according to the naive regression formula) and choose the best performing one
+ - We check if the neural network is capable of finding the hidden modelled effect. 
+ - If so, we rerun our Experiment with varying distribution of error terms, to see if the effect still can be detected.
+
+The chapter *Usage example: Detection of Subgroup effects* is an introductory example of this workflow and showcases the capabilities of the NN approach. The following chapters investigate the effects in more detail.
+
+**Note**: If you want to recompute the different steps, be warned: it may take several minutes to compute some chunk. The training time is non-linearly dependent on the number of input variables and the size of the dataset. Alterations to the parameters down below can alter the training time drastically. Use the verbose = false option to print an approximation of the training process.
+
+
+# Generation of Datset
+We begin our analysis with the creation of an initial simulated dataset.
+Seed is 8188, for the bibb Institute. The datset is automatically saved.
+Some notes on the simulated data: 
+
+- In general we sample from 11 feasible parameterized sample distributions <dist>.
+- If the distribution is parametrized we consider the values <val> for the parameters:  
+       -- par \in (0,1) all steps of size 0,1
+       -- par \in (0, infinity) steps from size 2^-3 starting from 0 until 2^3
+       -- par \in (-infiinity,infinity) steps from size 2^-3 starting from 0 to 2^3
+       -- par discrete  \in (0,10)
+- For each combination of parameters, we sample at least 25 variables <varNo>. 
+- Normal and Uniorm distribution receive 200 variables
+
+```{r}
+source("SimulationRoutines.R")
+df <- generate_samples(seed=8188, 10000)
+save(df, file = "../Data/dataset_8188.RData")
+```
+
+
+As the sampling should be independent, the correlations should be distributed around 0. To verify the randomness of the sample, we plot the historgram of correlations. 
+
+
+```{r warning=FALSE}
+# Compute Correlations
+correlations <- cor(df)
+# Remove duplicates
+correlations_vector <- as.vector(correlations) 
+upper_half_of_correlations <- correlations_vector[as.vector(upper.tri(correlations))]
+# Plot
+hist(upper_half_of_correlations, xlab = "Correlations in simulated Data", main = "Histogram of Correlations")
+# Clean up Working Space
+rm(list = c("correlations","correlations_vector", "upper_half_of_correlations"))
+```
+
+# Usage example: Detection of Subgroup effects
+For the Detection of Subgroup Effects we will consider dependent variable of the form
+Y = f(X) + b * g(X) + e
+Where b is a hidden binary variable (parameter p). As an initial step we will consider separate analysis for p = 0.5, with f(.) being the sum of 10 randomly normal distributed variables and g(.) half of the sum of the latest 5 variables. Error terms are excluded for this example. 
+
+```{r}
+#Select relevant variables
+example_df_subgroup <- df[,c(2:11,406)]
+# Compute Y according to the formula above
+example_df_subgroup$Y = rowSums(example_df_subgroup[,1:10]) + example_df_subgroup$rbern_1_0.5 * 0.5 * rowSums(example_df_subgroup[,6:10]) 
+# Show linear model
+summary(lm(Y ~ rnorm_1 + rnorm_2 + rnorm_3 + rnorm_4 + rnorm_5 + rnorm_6 + rnorm_7 + rnorm_8 + rnorm_9 + rnorm_10 + rbern_1_0.5  ,example_df_subgroup))
+```
+The regression results are as expected with coefficients either close to 1 or close to 1.25. The dependency on rbern_1_0.5 is not detected at all, as the effect size of rbern_1_0.5 is 0 on average. 
+
+## Detection of Interactions based on the same input variables
+As a comparison we can train the neural networks.
+The underlying subroutine will compute Neural Networks of different structures on the given datasets . The neural networks differ in the size of neurons in the hidden layers and are trained on 80% of the data. Finally a neural network structure will be selected that performs best in average on the test data sets (20% of observations will be assigned at random per NN to this class). For this structure of Neural Network, several Neural Networks are trained simultaneously and we will choose the best one for our computations. 
+
+```{r message=FALSE}
+
+source("NeuralNetworkAnalysis.R")
+example_first_NN <- compute_best_NN(example_df_subgroup, "Y", low=2, high=10, verbose=TRUE)
+example_first_mymodel <- example_first_NN$model
+example_best_itteration <- which.min(example_first_mymodel$result.matrix[c("error"),])
+example_first_weights <- example_first_mymodel$weights[[example_best_itteration]][[1]]
+print(example_first_weights)
+```
+Just by printing the weights (of the first neural network according to the optimal structure) we might interpret, that the trained neural Network is capable of learning our function. 
+ - The first neuron seems to ignore the Bernoulli distributed variable just compute the average linear effects of all norammaly distributed variables,
+ - g(x) might be entirely encoded in Neuron 2. With [12,2] marking the influence of the Bernoulli distributed variable and [7,2] - [11,2] showing the input  We can see this effect of internal weights for example by looking at neuron 3. The Bias [1,] corresponds almost exaclty to the sum of the weights [7,] - [12,]. It might be, that neuron 3 neutralizes the effect of rnorm6- rnorm10 entirely, what would be perfect for our case. But maybe this is just by chance.
+
+The only reason, we could see something is that we have a priori believes about the effect (actually we know them). To perform some real inference we need therefore to consider also the weightings for the output neuron and analyse the interactions of the neurons between each other.
+```{r}
+library(ggplot2)
+
+#Iterate over multiple of the trained models
+
+# Calculate the values for our complete dataset
+example_applied_model <- compute(example_first_mymodel, example_df_subgroup, rep=example_best_itteration)
+#Extract hidden neurons
+example_hidden_neurons <- example_applied_model$neurons[[2]]
+example_hidden_neurons <- example_hidden_neurons[,-1]
+# Weight hidden neurons bei their synapsis weight for the output neuron
+example_weights_output <- example_first_mymodel$weights[[example_best_itteration]][[2]]
+example_weights_output <- example_weights_output[-1]
+example_hidden_weighted <- example_hidden_neurons %*% diag(example_weights_output)
+
+colnames(example_hidden_weighted) <- c("hidden1", "hidden2", "hidden3")
+
+example_output_neurons <- example_applied_model$net.result
+example_df_subgroup_hidden <- cbind(example_df_subgroup,example_hidden_weighted, example_output_neurons)
+print(ggplot(example_df_subgroup_hidden, aes(Y, hidden3)) + geom_smooth(aes(y=hidden1, colour="Hidden neuron 1")) + geom_smooth(aes(y=hidden2, colour="Hidden neuron 2")) + geom_smooth(aes(y=hidden3, colour="Hidden neuron 3")))
+
+```
+Even considering the weighted activities of the hidden neurons is not enough to see what is going on. For the case of discrete variables, we can directly showcase the differences, by plotting against each other, the group_based effects.
+
+```{r}
+# Calculate the values for our complete dataset
+
+example_df_subgroup_hidden_true <- example_df_subgroup_hidden[(example_df_subgroup_hidden$rbern_1_0.5 == 1), ]
+example_df_subgroup_hidden_false <- example_df_subgroup_hidden[(example_df_subgroup_hidden$rbern_1_0.5 == 0), ]
+
+print(ggplot() + geom_smooth(data = example_df_subgroup_hidden_true, aes(x= Y, y=hidden1, colour="Hidden neuron 1 - true")) + geom_smooth(data = example_df_subgroup_hidden_true, aes(x= Y,y=hidden2, colour="Hidden neuron 2 - true")) + geom_smooth(data = example_df_subgroup_hidden_true, aes(x= Y,y=hidden3, colour="Hidden neuron 3 - true")) + geom_smooth(data = example_df_subgroup_hidden_false, aes(x= Y,y=hidden1, colour="Hidden neuron 1 - false")) + geom_smooth(data = example_df_subgroup_hidden_false, aes(x= Y,y = hidden2, colour="Hidden neuron 2 - false")) + geom_smooth(data = example_df_subgroup_hidden_false, aes(x= Y,y=hidden3, colour="Hidden neuron 3 - false ")))
+
+```
+This seems to confirm our hypothesis that neuron 3 might neutralize the effects of rnorm_6 - rnorm_10 (in average), as its activity is almost the same regardless of the value of the bernoulli distributed Variable. But, what if we didn't knew the distribution a priori ?
+This task requires that we check all possible interactions between variables and how they behave. The key about the neural network is, that we are not able to entirely revert it, but we can compute the derivates in all directions for our observations. 
+Lets assume that our learned function t(x) in the neural network corresponds to the true regression function f(x).
+- If f(x) is the sum of random continous variables, then df(x)/dx_i should be constant for all outputs.
+- If f(x) is contains interactions for continous variables x_i,x_j, then df(x)/d_xi should not be constant anymore.
+- If f(x) contains interactions for a continous and a bernoulli variable x_i+x_i*b_i the derivates should be constant, but with a different value if (b_i=0) or (b_i=1)
+
+Of course assuming the reverse implication is logically not given if we are in an absolute world, but considering odds the reversion might be likely.
+
+```{r}
+example_derivates <- compute(example_first_mymodel, example_df_subgroup, rep=example_best_itteration)
+example_output_hidden_neurons <- example_derivates$neurons[[2]]
+example_output_hidden_neurons <- example_output_hidden_neurons[,-1]
+
+logistic_derivate <- function(x){
+  f_x <- 1/(1+exp(-x))
+  return (f_x *(1-f_x))
+}
+
+example_nn_output <- example_derivates$net.result
+colnames(example_nn_output) <- c("estimate")
+example_derivates_hidden_neurons <- apply(example_output_hidden_neurons,2, logistic_derivate)
+example_derivates_hidden_neurons <- example_derivates_hidden_neurons %*% diag(example_weights_output)
+
+example_weights_hidden_neurons <- example_first_mymodel$weights[[example_best_itteration]][[1]]
+example_weights_hidden_neurons <- example_weights_hidden_neurons[-1,]
+
+example_derivates_per_input <- example_derivates_hidden_neurons %*% t(example_weights_hidden_neurons)
+colnames(example_derivates_per_input) <- c("d1","d2","d3","d4","d5","d6","d7","d8","d9","d10","d11")
+example_data_and_derivates <- cbind(example_df_subgroup, example_nn_output, example_derivates_per_input)
+example_data_and_derivates_true <-  example_data_and_derivates [(example_data_and_derivates $rbern_1_0.5 == 1), ]
+example_data_and_derivates_false<-  example_data_and_derivates [(example_data_and_derivates $rbern_1_0.5 == 0), ]
+
+for(name in colnames(example_derivates_per_input[,-dim(example_derivates_per_input)[2]])){
+plot <- ggplot() + geom_smooth(data = example_data_and_derivates_true, aes(x=rnorm_1 ,  y=example_data_and_derivates_true[,name], colour=paste0("derviate ",name," - true"))) +
+      geom_smooth(data = example_data_and_derivates_false, aes(x= rnorm_1 , y=example_data_and_derivates_false[,name], colour=paste0("derviate ",name," - false")))
+print(plot)
+}
+
+```
+
+In fact, we see unfortunatly (small) increasing derivatives for all variables, something we should not observe from the previously expected theory. This could be due to the fact, that a high output of X_1 correlates with a high output of Y, which correlates with a high output of the depicted variables. To see if this is the case and if we can still distinguish real dependencies between the continous variables, we need to run further experiments.
+
+Nevertheless we are also able to see huger differences in the curves for the variables, that are influenced by the Bernoulli distributed variable, which is promising. In fact, if we account for the normality of our data, the area where most of our data lies, between -1,96 and 1,96 shows the difference in the effect quite strongly. 
+As a last step of our example analysis, we will take a look at the density plots of the distribution of our variables, in terms of the bernoulli distributed variable. 
+
+```{r}
+for(name in colnames(example_derivates_per_input[,-dim(example_derivates_per_input)[2]])){
+plot <- ggplot() + geom_density(data = example_data_and_derivates_true, aes(x= example_data_and_derivates_true[,name], colour=paste0("derviate ",name," - true"))) +
+      geom_density(data = example_data_and_derivates_false, aes(x=example_data_and_derivates_false[,name], colour=paste0("derviate ",name," - false")))
+print(plot)
+}
+```
+
+In general, to analyse under which conditions our NN approach holds, we need to extend the variety of our models and test also for different distributions and formulas, which will be part of future research.
+
+
+
